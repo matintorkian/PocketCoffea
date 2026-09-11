@@ -203,12 +203,12 @@ class JetsCalibrator(Calibrator):
             btag_b='btagUParTAK4B'
             btag_cvl='btagUParTAK4CvL'
             do_plus_neutrino = "PlusNeutrino" in jet_type
-        elif "UParT" in jet_type:
-            # NanoAOD branch names use UParTAK4, while the JEC payload uses UParT
-            pt_raw_corr = "UParTAK4RegPtRawCorr"
-            pt_raw_corr_neutrino = "UParTAK4RegPtRawCorrNeutrino"
-            btag_b = "btagUParTAK4B"
-            btag_cvl = "btagUParTAK4CvL"
+        elif "UParTAK4" in jet_type:
+            # Use UParTAK4 regression
+            pt_raw_corr='UParTAK4RegPtRawCorr'
+            pt_raw_corr_neutrino='UParTAK4RegPtRawCorrNeutrino'
+            btag_b='btagUParTAK4B'
+            btag_cvl='btagUParTAK4CvL'
             do_plus_neutrino = "PlusNeutrino" in jet_type
         else:
             raise ValueError(f"Regression algorithm {jet_type} is not supported."+
@@ -228,10 +228,10 @@ class JetsCalibrator(Calibrator):
             reg_j_factor = j_flat[pt_raw_corr]
             if do_plus_neutrino:
                 reg_j_factor = reg_j_factor * j_flat[pt_raw_corr_neutrino]
-        elif "UParT" in jet_type:
+        elif "UParTAK4" in jet_type:
             if do_plus_neutrino:
                 reg_j_factor = j_flat[pt_raw_corr_neutrino]
-            else:
+            else:                
                 reg_j_factor = j_flat[pt_raw_corr]
 
         # Obtain the regressed PT and Mass
