@@ -515,6 +515,15 @@ In default `"skim"` mode the skim is a pure "drop obviously useless events" stag
 look at branches that exist before any object correction. This is the standard recipe and what the rest of the
 documentation assumes.
 
+#### Resubmitting a partially failed skim
+
+Set `workflow_options={"skim_skip_existing": True}` to skip the ROOT write and copy of a chunk whose output file
+already exists at the destination with the expected number of events (the file is opened with uproot, also through
+XRootD; a missing, partial or corrupted file is rewritten). The chunk is still fully processed, so the cutflow,
+`sum_genweights` and the skimmed dataset definition are complete. Use it only when you resubmit the **same** config
+with the **same** chunksize: the output filename is built from the input file uuid and the chunk entry range, so a
+different chunksize produces new files and the old ones are stale.
+
 #### `skim_mode: "presel_any_variation"`
 
 The variation-aware mode lets you push the skim much closer to the analysis preselection without losing events that
@@ -1203,6 +1212,35 @@ At the moment the output columns gets accumulated over all the chunks of the pro
 file. 
 This may cause memory problems in case of a large number of events or exported data. A solution is to export single
 files separately: the option is under development. 
+:::
+
+
+### Exported weight columns
+
+Besides the `ColOut` collections you request, the columns output **automatically** includes
+the event weight, so the exported arrays can be used directly for weighted analysis or ML
+training without recomputing it:
+
+- **`weight`** — the nominal total event weight of that category: the product of the
+  inclusive weights, the by-category weights and, for a `sample__subsample` output, the
+  by-subsample weights. It is exactly the weight used to fill the histograms of the same
+  (sample/subsample, category), masked with the same category (and subsample) selection as
+  the exported columns.
+- **`weight_variation_{name}`** — *MC only*. One column per weight variation configured in
+  the `variations["weights"]` block (e.g. `weight_variation_sf_btagUp`,
+  `weight_variation_sf_btagDown`). Data outputs carry no weight-variation columns.
+
+All weight columns share the same length as the other columns of the category (they are
+masked identically). When dumping per-chunk parquet arrays
+(`dump_columns_as_arrays_per_chunk`, see below) the `weight` field is added to the awkward
+array in the same way.
+
+:::{note}
+For subsample outputs the `weight` column folds in the by-subsample weights (the same
+`<sample>__<subsample>` weights configured in the `weights["bysample"]` block). If you are
+on an older PocketCoffea version whose subsample `weight` column looks like the inclusive
+sample weight (missing the by-subsample factor), update to a version that includes the
+by-subsample column-weight fix.
 :::
 
 

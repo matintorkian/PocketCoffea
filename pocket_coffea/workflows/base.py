@@ -9,6 +9,8 @@ from copy import deepcopy
 import copy
 import os
 import logging
+import shutil
+import tempfile
 import time
 
 from coffea import processor
@@ -19,8 +21,9 @@ from ..lib.columns_manager import ColumnsManager
 from ..lib.hist_manager import HistManager
 from ..lib.jets import load_jet_factory
 from ..lib.calibrators.calibrators_manager import CalibratorsManager
-from ..utils.skim import uproot_writeable, copy_file, apply_skim_sumgenweights_override
+from ..utils.skim import uproot_writeable, copy_file, apply_skim_sumgenweights_override, skimmed_file_is_complete
 from ..utils.utils import dump_ak_array
+from ..utils.metadata import to_bool
 from ..lib.delayed_eval import DelayedEvalBranchManager
 
 from ..utils.configurator import Configurator
@@ -130,12 +133,9 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         self._samplePart = self.events.metadata.get("part", None) # this is the (optional) name of the part of the sample
 
         self._year = self.events.metadata["year"]
-        self._isMC = ((self.events.metadata["isMC"] in ["True", "true"])
-                      or (self.events.metadata["isMC"] == True))
+        self._isMC = to_bool(self.events.metadata["isMC"])
         # if the dataset is a skim the sumgenweights are scaled by the skim efficiency
-        self._isSkim = ("isSkim" in self.events.metadata and self.events.metadata["isSkim"] in ["True","true"]) or(
-            "isSkim" in self.events.metadata and self.events.metadata["isSkim"] == True)
-        # for some reason this get to a string WIP
+        self._isSkim = to_bool(self.events.metadata.get("isSkim", False))
         if self._isMC:
             self._era = "MC"
             self._xsec = self.events.metadata["xsec"]
@@ -236,18 +236,34 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             )
             + ".root"
         )
-        with uproot.recreate(f"{filename}", compression=uproot.ZSTD(5)) as fout:
-            fout["Events"] = uproot_writeable(self.events)
-        # copy the file
-        copy_file(
-            filename, "./", self.cfg.save_skimmed_files_folder, subdirs=[self._dataset]
-        )
+        destination = os.path.join(self.cfg.save_skimmed_files_folder, self._dataset, filename)
+        # workflow_options["skim_skip_existing"]: on a resubmission, keep the
+        # metadata (cutflow, sum_genweights, file list) but do not rewrite a
+        # chunk whose file at the destination already has the expected number
+        # of events. A missing, partial or corrupted file is rewritten.
+        skip_existing = (self.workflow_options or {}).get("skim_skip_existing", False)
+        if skip_existing and skimmed_file_is_complete(destination, self.nEvents_after_skim):
+            logging.info(f"[skim] {self._dataset}: {filename} exists with {self.nEvents_after_skim} events, skip write")
+        else:
+            # Write the chunk in a temporary working directory instead of the cwd,
+            # which is often on AFS: TMPDIR (or the HTCondor scratch) points to
+            # node-local storage. copy_file deletes the local file after the copy;
+            # the directory itself is cleaned up here, also on failure.
+            tmpdir = tempfile.mkdtemp(
+                prefix="skim_",
+                dir=os.environ.get("TMPDIR") or os.environ.get("_CONDOR_SCRATCH_DIR"),
+            )
+            try:
+                with uproot.recreate(os.path.join(tmpdir, filename), compression=uproot.ZSTD(5)) as fout:
+                    fout["Events"] = uproot_writeable(self.events)
+                # copy the file
+                copy_file(
+                    filename, tmpdir, self.cfg.save_skimmed_files_folder, subdirs=[self._dataset]
+                )
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
         # save the new file location for the new dataset definition
-        self.output["skimmed_files"] = {
-            self._dataset: [
-                os.path.join(self.cfg.save_skimmed_files_folder, self._dataset, filename)
-            ]
-        }
+        self.output["skimmed_files"] = {self._dataset: [destination]}
         self.output["nskimmed_events"] = {self._dataset: [self.nEvents_after_skim]}
 
     @abstractmethod
@@ -393,6 +409,12 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         also sum their nominal weights (for each sample, by chunk).
         Store the results in the `cutflow` and `sumw` outputs
         '''
+        # Subsample masks are category-independent, so reduce them once per chunk
+        # here instead of re-running storage.all() for every category below.
+        subsample_masks = (
+            list(self._subsamples[self._sample].get_masks())
+            if self._hasSubsamples else []
+        )
         for category, mask in self._categories.get_masks():
             if self._categories.is_multidim and mask.ndim > 1:
                 # The Selection object can be multidim but returning some mask 1-d
@@ -409,7 +431,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
 
             # If subsamples are defined we also save their metadata
             if self._hasSubsamples:
-                for subs, subsam_mask in self._subsamples[self._sample].get_masks():
+                for subs, subsam_mask in subsample_masks:
                     # get the subsample specific weight
                     mask_withsub = mask_on_events & subsam_mask
                     self.output["cutflow"][category].setdefault(self._dataset, {}).setdefault(f"{self._sample}__{subs}", {})[variation] = ak.sum(mask_withsub)
@@ -536,13 +558,17 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 if self.workflow_options is not None and self.workflow_options.get("dump_columns_as_arrays_per_chunk", None) is not None:
                     # filling awkward arrays to be dumped per chunk
                     if self.column_managers[subs].ncols == 0:
-                        break
+                        # this subsample has no columns to dump; skip it but keep
+                        # processing the remaining subsamples (a `break` here would
+                        # silently drop every later subsample's columns)
+                        continue
                     out_arrays = self.column_managers[subs].fill_ak_arrays(
                                                self.events,
                                                self._categories,
                                                variation,
                                                subsample_mask=self._subsamples[self._sample].get_mask(subs),
-                                               weights_manager=self.weights_manager
+                                               weights_manager=self.weights_manager,
+                                               subsample=f"{self._sample}__{subs}"
                                                )
                     fname = (self.events.behavior["__events_factory__"]._partition_key.replace("/", "_")
                         + ".parquet")
@@ -555,14 +581,18 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                     # Filling columns to be accumulated for all the chunks
                     # Calling hist manager with a subsample mask
                     if self.column_managers[subs].ncols == 0:
-                        break
+                        # this subsample has no columns to dump; skip it but keep
+                        # processing the remaining subsamples (a `break` here would
+                        # silently drop every later subsample's columns)
+                        continue
                     outcols[f"{self._sample}__{subs}"] = {
                         self._dataset: self.column_managers[subs].fill_columns_accumulators(
                                                    self.events,
                                                    self._categories,
                                                    variation,
                                                    subsample_mask=self._subsamples[self._sample].get_mask(subs),
-                                                   weights_manager=self.weights_manager
+                                                   weights_manager=self.weights_manager,
+                                                   subsample=f"{self._sample}__{subs}"
                                                    )
                     }
         else:
@@ -616,10 +646,13 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         # Filling the special histograms for processing metadata if they are present
         total_processing_time = self.stop_time - self.start_time # in seconds
         add_axes = {"variation":"nominal"} if self._isMC else {}
+        # nEvents_after_presel is per-variation; use the value captured on the
+        # nominal pass so this "nominal"-axis metadata is not the last variation's.
+        n_presel = getattr(self, "_nEvents_after_presel_nominal", self.nEvents_after_presel)
         if self._hasSubsamples:
             for subs in self._subsamples[self._sample].keys():
                 for k, n in zip(["initial", "skim","presel"],
-                                [self.nEvents_initial, self.nEvents_after_skim, self.nEvents_after_presel ]):
+                                [self.nEvents_initial, self.nEvents_after_skim, n_presel ]):
                     if hepc := self.hists_manager.get_histogram(subs, f"events_per_chunk_{k}"):
                         hepc.hist_obj.fill(
                             cat=hepc.only_categories[0],
@@ -818,12 +851,14 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
 
         # --- Systematic-aware skimming logic
         if self.cfg.save_skimmed_files and skim_mode == "presel_any_variation":
+            # Keep a reference to the uncalibrated events
+            # Taking a snapshot of the events references before any change, in order to avoid
+            # saving the added collections in the skimmed file. The skimmed file should contain only the original NanoAOD branches.
+            events_after_skim = copy.copy(self.events)  #just a shallow copy of the events reference, not a deep copy of the data
+            pass_any_variation = np.zeros(len(self.events), dtype=bool)
+
             self.process_extra_after_skim()
             self.initialize_calibrators()
-
-            # Keep a reference to the uncalibrated events
-            events_after_skim = self.events
-            pass_any_variation = np.zeros(len(self.events), dtype=bool)
 
             # Dry-run loop to accumulate the OR of preselection masks
             n_variations = 0
@@ -893,6 +928,13 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             # This will remove all the events not passing preselection
             # from further processing
             self.apply_preselections(variation)
+
+            # nEvents_after_presel is overwritten by every variation; remember the
+            # nominal one so save_processing_metadata (run once after this loop)
+            # records the nominal preselection count under the "nominal" axis
+            # instead of whichever variation happened to run last.
+            if variation == "nominal":
+                self._nEvents_after_presel_nominal = self.nEvents_after_presel
 
             # If not events remains after the preselection we skip the chunk
             if not self.has_events:
@@ -984,12 +1026,12 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 if rescale and dataset in sumgenw_dict:
                     scaling = 1 / sumgenw_dict[dataset]
                     for sample in dataset_data.keys():
-                        if "nominal" in dataset_data[sample].keys():
-                            dataset_data[sample]["nominal"] *= scaling
-                        else:
+                        if "nominal" not in dataset_data[sample].keys():
                             print("Warning: there is no nominal hist for this sample: ", sample)
                             print(cat, catdata)
-                            
+                        for variation in dataset_data[sample].keys():
+                            dataset_data[sample][variation] *= scaling
+
         # rescale sumw2
         for cat, catdata in output["sumw2"].items():
             for dataset, dataset_data in catdata.items():
@@ -1012,8 +1054,8 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 if rescale and dataset in sumgenw_dict:
                     scaling = 1/sumgenw_dict[dataset]**2
                     for sample in dataset_data.keys():
-                        if "nominal" in dataset_data[sample].keys():
-                            dataset_data[sample]["nominal"] *= scaling
+                        for variation in dataset_data[sample].keys():
+                            dataset_data[sample][variation] *= scaling
 
     def postprocess(self, accumulator):
         '''
@@ -1073,9 +1115,9 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         for var, vardata in accumulator["variables"].items():
             for samplename, dataset_in_sample in vardata.items():
                 for dataset, histo in dataset_in_sample.items():
-                    if any(np.isnan(histo.values().flatten())):
+                    if not np.all(np.isfinite(histo.values().flatten())):
                         raise Exception(
-                            f"NaN values in the histogram {var} for dataset {dataset} after rescaling"
+                            f"NaN or Inf values in the histogram {var} for dataset {dataset} after rescaling"
                         )
 
         return accumulator

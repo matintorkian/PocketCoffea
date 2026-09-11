@@ -1,8 +1,10 @@
+import functools
 import gzip
 import cloudpickle
 import awkward as ak
 import numpy as np
 import correctionlib
+from pocket_coffea.lib.correction_cache import load_correction_set
 from coffea.jetmet_tools import  CorrectedMETFactory
 from correctionlib.schemav2 import Correction, CorrectionSet
 from ..utils.utils import get_nano_version, replace_at_indices
@@ -229,7 +231,7 @@ def compute_jetId(events, jet_type, params, year):
         # Example code: https://gitlab.cern.ch/cms-nanoAOD/jsonpog-integration/-/blob/master/examples/jetidExample.py?ref_type=heads
         # Load CorrectionSet
         jsonFile = params.jet_scale_factors.jet_id[year]
-        cset = correctionlib.CorrectionSet.from_file(jsonFile)
+        cset = load_correction_set(jsonFile)
 
         counts = ak.num(jets)
         jets = ak.flatten(jets, axis=1)
@@ -272,11 +274,200 @@ def compute_jetId(events, jet_type, params, year):
         return ak.unflatten(id_value, counts)
 
 
+def get_btag_wp_threshold(btag, wp, tagger=None):
+    """Return the numeric threshold of a working point, resolving the tagger.
+
+    ``btag`` is the per-year b-tagging block ``btagging.working_point.<year>``.
+    Both the flat (``btagging_WP: {L: ...}``) and the nested-by-tagger
+    (``btagging_WP: {<tagger>: {L: ...}}``) layouts are supported.
+
+    Args:
+        btag: the per-year b-tagging parameters block.
+        wp: working-point name (e.g. ``"L"``, ``"M"``, ``"T"``).
+        tagger: b-tag discriminant branch. When ``None`` it is taken from
+            ``btag["btagging_algorithm"]``.
+
+    Returns:
+        float: the discriminant threshold for the working point.
+    """
+    if tagger is None:
+        tagger = btag["btagging_algorithm"]
+    wps = btag["btagging_WP"]
+    return wps[tagger][wp] if tagger in wps else wps[wp]
+
+
 def btagging(Jet, btag, wp, veto=False):
+    tagger = btag["btagging_algorithm"]
+    threshold = get_btag_wp_threshold(btag, wp, tagger)
     if veto:
-        return Jet[Jet[btag["btagging_algorithm"]] < btag["btagging_WP"][wp]]
+        return Jet[Jet[tagger] < threshold]
     else:
-        return Jet[Jet[btag["btagging_algorithm"]] > btag["btagging_WP"][wp]]
+        return Jet[Jet[tagger] > threshold]
+
+
+def get_btag_wp_score(params, year, wp, tagger):
+    """Read a b-tag working-point discriminant cut from the BTV correctionlib JSON.
+
+    The score is taken directly from the same ``btagging.json.gz`` that provides
+    the shape SF (``jet_scale_factors.btagSF.<year>.file``), so the cut applied to
+    the jets and the SF applied to them always refer to the same tagger and
+    campaign. The BTV file exposes the working-point values under a
+    ``<tagger>_wp_values`` correction (see ``btagging.btag_wp_values_map`` in the parameters YAML).
+
+    Args:
+        params: PocketCoffea parameters (with the ``jet_scale_factors`` section).
+        year: data-taking year key used to index ``jet_scale_factors.btagSF``.
+        wp: working-point name (e.g. ``"L"``, ``"M"``, ``"T"``).
+        tagger: b-tag discriminant branch (e.g. ``"btagPNetB"``), selecting which
+            per-tagger ``_wp_values`` correction to read.
+
+    Returns:
+        float: the discriminant cut value for the working point.
+    """
+    btagSF = params["jet_scale_factors"]["btagSF"][year]
+    cset = load_correction_set(btagSF["file"])
+    wp_values_map = params["btagging"]["btag_wp_values_map"]
+    corr_name = wp_values_map.get(tagger)
+    if corr_name is None:
+        raise KeyError(
+            f"No BTV working-point-values correction is known for tagger '{tagger}'. "
+            f"Known taggers: {sorted(wp_values_map)}."
+        )
+    if corr_name not in cset:
+        raise KeyError(
+            f"Correction '{corr_name}' not found in b-tagging file "
+            f"'{btagSF['file']}'. Available corrections: {list(cset)}."
+        )
+    return float(cset[corr_name].evaluate(wp))
+
+
+def get_btag_working_point(params, year, wp="L", tagger=None):
+    """Resolve the b-tag discriminant branch and its working-point cut.
+
+    The discriminant branch (what to cut on) comes from the ``btagging``
+    parameters, while the cut value is read directly from the BTV correctionlib
+    JSON via :func:`get_btag_wp_score`, so it always matches the tagger and
+    campaign used for the shape SF.
+
+    Args:
+        params: PocketCoffea parameters (``btagging`` and ``jet_scale_factors``).
+        year: data-taking year key used to index the parameters.
+        wp: working-point name (e.g. ``"L"``, ``"M"``, ``"T"``); default loose.
+        tagger: b-tag discriminant branch. When ``None`` it is taken from
+            ``btagging.working_point.<year>.btagging_algorithm``.
+
+    Returns:
+        tuple(str, float): the tagger branch and its WP cut value.
+    """
+    wp_params = params["btagging"]["working_point"][year]
+    if tagger is None:
+        tagger = wp_params["btagging_algorithm"]
+    return tagger, get_btag_wp_score(params, year, wp, tagger)
+
+
+def _resolve_btag_threshold(
+    params, year, btag_algorithm=None, btag_wp=None, btag_score=None
+):
+    """Resolve the ``(tagger, threshold)`` to cut on.
+
+    Args:
+        params: PocketCoffea parameters (with the ``btagging`` section).
+        year: data-taking year key.
+        btag_algorithm: discriminant branch; defaults to the tagger in params.
+        btag_wp: working-point name; defaults to loose ``"L"``.
+        btag_score: raw threshold value, mutually exclusive with ``btag_wp``.
+
+    Returns:
+        tuple(str, float): the tagger branch and the numeric threshold.
+    """
+    if btag_score is not None:
+        if btag_wp is not None:
+            raise ValueError("Pass only one of `btag_wp` or `btag_score`.")
+        tagger = btag_algorithm
+        if tagger is None:
+            tagger = params["btagging"]["working_point"][year]["btagging_algorithm"]
+        return tagger, btag_score
+    return get_btag_working_point(params, year, btag_wp or "L", btag_algorithm)
+
+
+def _first_valid_jets(collections):
+    """Reduce a fallback chain to one collection, per jet.
+
+    Args:
+        collections: a single jet collection, or an ordered list of them. For
+            each jet the first collection with a valid pT (``pt > 0``) is kept;
+            the last collection is used as the unconditional fallback.
+
+    Returns:
+        The resolved jet collection.
+    """
+    if not isinstance(collections, (list, tuple)):
+        return collections
+    collections = list(collections)
+    result = collections[-1]
+    for jets in reversed(collections[:-1]):
+        result = ak.where(ak.nan_to_num(jets.pt, nan=-1) > 0, jets, result)
+    return result
+
+
+def merge_regressed_jets(
+    jets_high_btag,
+    jets_low_btag=None,
+    params=None,
+    year=None,
+    btag_algorithm=None,
+    btag_wp=None,
+    btag_score=None,
+):
+    """Merge pT-regressed jet collections choosing, per jet, on a b-tag cut.
+
+    Jets with a b-tag discriminant ``>=`` the threshold take ``jets_high_btag``,
+    the others take ``jets_low_btag``. Taking whole collections (not just pT)
+    keeps every pT-dependent field (pt, mass, systematic variations) consistent
+    within a jet.
+
+    Args:
+        jets_high_btag: collection, or ordered fallback chain, for jets passing
+            the b-tag cut. In a chain the first collection with a valid
+            regression (``pt > 0``) is used per jet and the last one is the
+            unconditional fallback (typically the standard JEC-only jets).
+        jets_low_btag: same, for jets failing the cut. If ``None`` no cut is
+            applied and all jets use ``jets_high_btag``.
+        params: PocketCoffea parameters (needed only when a cut is applied).
+        year: data-taking year key (needed only when a cut is applied).
+        btag_algorithm: discriminant branch to cut on (e.g. ``"btagPNetB"``);
+            defaults to the tagger in the b-tagging parameters.
+        btag_wp: working-point name used as threshold; defaults to loose ``"L"``.
+        btag_score: raw threshold value, mutually exclusive with ``btag_wp``.
+
+    Returns:
+        The merged jet collection.
+
+    Examples::
+
+        # use the regression where valid, else the standard jets
+        merge_regressed_jets([jets_reg, jets_std])
+        # as above, but high b-tag jets always use the regression (loose WP)
+        merge_regressed_jets(jets_reg, [jets_reg, jets_std], params, year)
+        # +neutrino regression for high b-tag jets, plain for the rest, medium WP
+        merge_regressed_jets([jets_nu, jets_noNu, jets_std], [jets_noNu, jets_std],
+                             params, year, btag_algorithm="btagPNetB", btag_wp="M")
+    """
+    high = _first_valid_jets(jets_high_btag)
+    if jets_low_btag is None:
+        return high
+    low = _first_valid_jets(jets_low_btag)
+
+    tagger, threshold = _resolve_btag_threshold(
+        params, year, btag_algorithm, btag_wp, btag_score
+    )
+    # the b-tag score is unchanged by the regression -> read it from any candidate
+    ref_jets = (
+        jets_high_btag[0]
+        if isinstance(jets_high_btag, (list, tuple))
+        else jets_high_btag
+    )
+    return ak.where(ref_jets[tagger] >= threshold, high, low)
 
 
 def CvsLsorted(jets,temp=None):    
@@ -366,8 +557,13 @@ def get_dijet(jets, taggerVars=True, remnant_jet = False):
         return dijet, remnant
 
 
+@functools.lru_cache(maxsize=None)
 def get_jer_correction_set(jer_json, jer_tags):
     # learned from: https://github.com/cms-nanoAOD/correctionlib/issues/130
+    # Cached per process by (jer_json, jer_tags): the JSON is parsed and the JERSmear
+    # evaluator built once. jer_tags is a tuple (hashable). The parsed schema is filtered
+    # in place, but that happens on this local object; the returned evaluator is read-only,
+    # so caching it does not share the mutated schema with any other consumer.
     with gzip.open(jer_json) as fin:
         cset = CorrectionSet.parse_raw(fin.read())
     cset.corrections = [
@@ -535,7 +731,7 @@ def jet_correction_corrlib(
     tag_jec = "_".join([jec_tag, level, jet_type])
 
     # get the correction sets
-    cset = correctionlib.CorrectionSet.from_file(json_path)
+    cset = load_correction_set(json_path)
 
     # prepare inputs
     # no need of copies
@@ -713,7 +909,7 @@ def msoftdrop_correction(
     tag_jec = "_".join([jec_tag, level, subjet_type])
 
     # get the correction sets
-    cset = correctionlib.CorrectionSet.from_file(json_path)
+    cset = load_correction_set(json_path)
 
     # prepare inputs
     jets_jagged = events[jet_coll_name]
@@ -912,3 +1108,27 @@ def msoftdrop_correction(
     #            jets_jagged[f"msoftdrop_JES_{jes_vari}_{shift}"] = new_msoftdrop
 
     return jets_jagged
+
+
+# Name of the field the JetsCalibrator writes on the jet collection to record the
+# permutation applied when it re-sorts the jets by corrected pt.
+JET_SORTIDX_FIELD = "pocket_sortidx"
+
+
+def jets_in_original_order(jets, sortidx_field=JET_SORTIDX_FIELD):
+    '''Return the jet collection in its original (NanoAOD) order.
+
+    The ``JetsCalibrator`` re-sorts the jet collection by the corrected pt (for both the
+    nominal and the systematic variations) and records the applied permutation as the
+    ``sortidx_field`` field of the collection. Per-jet indices carried by other
+    collections (e.g. ``Electron.jetIdx`` / ``Muon.jetIdx``) point into the *original*
+    NanoAOD order, so consumers that look a jet up by such an index must first undo the
+    re-sorting. Applying ``argsort`` to the stored permutation inverts it and restores the
+    original order.
+
+    If the field is absent (no calibrator re-sorting was applied, e.g. sorting disabled or
+    a collection the calibrator did not touch) the jets are returned unchanged.
+    '''
+    if sortidx_field in jets.fields:
+        return jets[ak.argsort(jets[sortidx_field], axis=1)]
+    return jets
