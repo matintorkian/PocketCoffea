@@ -1035,11 +1035,19 @@ class Shape:
                     loc=self.style.experiment_label_loc,
                     ax=self.ax,
                 )
+        # if self.toplabel:
+        #     hep.cms.lumitext(
+        #         text=self.toplabel,
+        #         fontsize=self.style.fontsize,
+        #         ax=self.ax,
+        #     )
         if self.toplabel:
-            hep.cms.lumitext(
-                text=self.toplabel,
+            self.ax.text(
+                1.0, 1.01, self.toplabel,
+                transform=self.ax.transAxes,
+                ha="right", va="bottom",
                 fontsize=self.style.fontsize,
-                ax=self.ax,
+                clip_on=False,
             )
         return self.fig, axes
 
