@@ -395,8 +395,8 @@ class Shape:
         self.is_mc_only = len(self.samples_data) == 0
         self.is_data_only = len(self.samples_mc) == 0
         self.rescale_samples()
-        if not self.is_data_only:
-            self.replace_missing_variations()
+        # if not self.is_data_only:
+        #     self.replace_missing_variations()
         self.load_attributes()
         self.load_syst_manager()
 
@@ -700,6 +700,10 @@ class Shape:
         else:
             raise NotImplementedError("Plotting histograms without collapsing is still not implemented")
 
+        ################
+        if self.samples_mc:
+            self.replace_missing_variations()
+        #########
         if not self.style.has_samples_groups:
             return
         h_dict_grouped = {}
